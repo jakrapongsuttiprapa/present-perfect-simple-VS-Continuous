@@ -1,0 +1,238 @@
+/**
+ * PRESENT PERFECT LAB — Backend (Google Apps Script + Google Sheets)
+ * By T.OAT
+ *
+ * วิธีติดตั้ง
+ * 1) สร้าง Google Sheet ใหม่ → ส่วนขยาย → Apps Script
+ * 2) ลบโค้ดเดิม วางโค้ดไฟล์นี้ทั้งหมด → บันทึก
+ * 3) ทำให้ใช้งานได้ → การทำให้ใช้งานได้รายการใหม่ → ประเภท: เว็บแอป
+ *    - เรียกใช้ในฐานะ: ฉัน
+ *    - ผู้ที่มีสิทธิ์เข้าถึง: ทุกคน
+ * 4) คัดลอก URL ที่ลงท้ายด้วย /exec ไปวางใน GAS_URL ในไฟล์ index.html
+ * 5) หน้าแอดมิน: เปิดลิงก์เว็บ + ?admin=1  หรือกดปุ่ม "👑 ครูโอ๊ต" ที่หน้าแรก (PIN เริ่มต้น 7846)
+ *
+ * ถ้าแก้โค้ดไฟล์นี้ภายหลัง ต้อง "จัดการการทำให้ใช้งานได้ → แก้ไข → เวอร์ชันใหม่" ทุกครั้ง
+ */
+
+var DEFAULT_PIN = '7846';
+var SHEET_NAME = 'Scores';
+var TZ = 'Asia/Bangkok';
+var MISSION_MAX = { A1: 10, A2: 12, A3: 12, B1: 12, B2: 8, B3: 8, EX: 12, WR: 3 };
+var MIDS = ['A1', 'A2', 'A3', 'B1', 'B2', 'B3', 'EX', 'WR'];
+var HEAD = ['key', 'ชั้น', 'เลขที่', 'ชื่อ-นามสกุล']
+  .concat(MIDS)
+  .concat(['รวม', 'ทำแล้ว', 'กำลังทำ', 'ส่งครั้ง', 'Write: PPS', 'Write: PPC', 'Write: PS', 'เข้าครั้งแรก', 'ล่าสุด', 'lastEpoch']);
+var COL = {};
+HEAD.forEach(function (h, i) { COL[h] = i + 1; });
+
+/* ---------- entry points ---------- */
+function doGet(e) {
+  return json_({ ok: true, app: 'Present Perfect Lab API' });
+}
+
+function doPost(e) {
+  var d;
+  try { d = JSON.parse(e.postData.contents); } catch (err) { return json_({ ok: false, error: 'bad_json' }); }
+  try {
+    switch (d.action) {
+      case 'checkPin': return json_({ ok: String(d.pin) === getPin_() });
+      case 'hello':    return json_(hello_(d));
+      case 'progress': return json_(progress_(d));
+      case 'finish':   return json_(finish_(d));
+      case 'list':     if (!pinOk_(d)) return json_({ ok: false, error: 'pin' }); return json_(list_());
+      case 'reset':    if (!pinOk_(d)) return json_({ ok: false, error: 'pin' }); return json_(reset_(d));
+      case 'resetAll': if (!pinOk_(d)) return json_({ ok: false, error: 'pin' }); return json_(resetAll_());
+      case 'setPin':   if (!pinOk_(d)) return json_({ ok: false, error: 'pin' }); return json_(setPin_(d));
+      default:         return json_({ ok: false, error: 'unknown_action' });
+    }
+  } catch (err) {
+    return json_({ ok: false, error: String(err) });
+  }
+}
+
+/* ---------- helpers ---------- */
+function json_(o) {
+  return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+}
+function getPin_() {
+  return PropertiesService.getScriptProperties().getProperty('PIN') || DEFAULT_PIN;
+}
+function pinOk_(d) { return String(d.pin) === getPin_(); }
+function now_() { return Utilities.formatDate(new Date(), TZ, 'dd/MM/yyyy HH:mm:ss'); }
+function clean_(s, n) { return String(s == null ? '' : s).replace(/[\r\n\t]+/g, ' ').trim().slice(0, n); }
+
+function sheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(SHEET_NAME);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_NAME);
+    sh.getRange(1, 1, 1, HEAD.length).setValues([HEAD]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function withLock_(fn) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var r = fn();
+    SpreadsheetApp.flush(); // เขียนให้เสร็จก่อนปลดล็อก กันแถวซ้ำ
+    return r;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function keyOf_(d) {
+  var cls = clean_(d.cls, 12), no = parseInt(d.no, 10);
+  if (!cls || !(no >= 1 && no <= 60)) throw new Error('bad_student');
+  return { key: cls + '|' + no, cls: cls, no: no, name: clean_(d.name, 80) };
+}
+
+function findRow_(sh, key) {
+  var last = sh.getLastRow();
+  if (last < 2) return 0;
+  var keys = sh.getRange(2, 1, last - 1, 1).getValues();
+  for (var i = 0; i < keys.length; i++) if (String(keys[i][0]) === key) return i + 2;
+  return 0;
+}
+
+function ensureRow_(sh, s) {
+  var r = findRow_(sh, s.key);
+  var t = now_();
+  if (!r) {
+    var row = HEAD.map(function () { return ''; });
+    row[COL['key'] - 1] = s.key;
+    row[COL['ชั้น'] - 1] = s.cls;
+    row[COL['เลขที่'] - 1] = s.no;
+    row[COL['ชื่อ-นามสกุล'] - 1] = s.name;
+    row[COL['รวม'] - 1] = 0;
+    row[COL['ทำแล้ว'] - 1] = 0;
+    row[COL['ส่งครั้ง'] - 1] = 0;
+    row[COL['เข้าครั้งแรก'] - 1] = t;
+    sh.appendRow(row);
+    r = sh.getLastRow();
+  } else if (s.name) {
+    sh.getRange(r, COL['ชื่อ-นามสกุล']).setValue(s.name);
+  }
+  sh.getRange(r, COL['ล่าสุด'], 1, 2).setValues([[t, Date.now()]]);
+  return r;
+}
+
+function readBest_(sh, r) {
+  var vals = sh.getRange(r, COL['A1'], 1, MIDS.length).getValues()[0];
+  var best = {};
+  MIDS.forEach(function (m, i) { if (vals[i] !== '' && vals[i] !== null) best[m] = Number(vals[i]); });
+  return best;
+}
+
+/* ---------- actions ---------- */
+function hello_(d) {
+  var s = keyOf_(d);
+  return withLock_(function () {
+    var sh = sheet_();
+    var r = ensureRow_(sh, s);
+    // รวมคะแนนจากเครื่องนักเรียน (ถ้าเคยทำตอนออฟไลน์) โดยเก็บค่าที่สูงกว่า
+    var best = readBest_(sh, r);
+    var local = d.best || {};
+    var changed = false;
+    MIDS.forEach(function (m) {
+      var v = Number(local[m]);
+      if (local[m] != null && isFinite(v)) {
+        v = Math.max(0, Math.min(MISSION_MAX[m], Math.round(v)));
+        if (best[m] == null || v > best[m]) { best[m] = v; changed = true; }
+      }
+    });
+    if (changed) writeBest_(sh, r, best);
+    sh.getRange(r, COL['กำลังทำ']).setValue('อยู่หน้าเมนู');
+    return { ok: true, best: best };
+  });
+}
+
+function writeBest_(sh, r, best) {
+  var tot = 0, done = 0;
+  var vals = MIDS.map(function (m) {
+    if (best[m] == null) return '';
+    tot += best[m]; done++;
+    return best[m];
+  });
+  sh.getRange(r, COL['A1'], 1, MIDS.length).setValues([vals]);
+  sh.getRange(r, COL['รวม'], 1, 2).setValues([[tot, done]]);
+}
+
+function progress_(d) {
+  var s = keyOf_(d);
+  return withLock_(function () {
+    var sh = sheet_();
+    var r = ensureRow_(sh, s);
+    sh.getRange(r, COL['กำลังทำ']).setValue(clean_(d.status, 60));
+    return { ok: true };
+  });
+}
+
+function finish_(d) {
+  var s = keyOf_(d);
+  var m = String(d.mission);
+  if (!MISSION_MAX.hasOwnProperty(m)) return { ok: false, error: 'bad_mission' };
+  var sc = Math.max(0, Math.min(MISSION_MAX[m], Math.round(Number(d.score) || 0)));
+  return withLock_(function () {
+    var sh = sheet_();
+    var r = ensureRow_(sh, s);
+    var best = readBest_(sh, r);
+    if (best[m] == null || sc > best[m]) best[m] = sc;
+    writeBest_(sh, r, best);
+    var att = Number(sh.getRange(r, COL['ส่งครั้ง']).getValue()) || 0;
+    sh.getRange(r, COL['ส่งครั้ง']).setValue(att + 1);
+    sh.getRange(r, COL['กำลังทำ']).setValue(m + ' เสร็จ ' + sc + '/' + MISSION_MAX[m]);
+    if (m === 'WR' && d.writing) {
+      sh.getRange(r, COL['Write: PPS'], 1, 3).setValues([[
+        clean_(d.writing.pps, 300), clean_(d.writing.ppc, 300), clean_(d.writing.ps, 300)
+      ]]);
+    }
+    return { ok: true, best: best };
+  });
+}
+
+function list_() {
+  var sh = sheet_();
+  var last = sh.getLastRow();
+  if (last < 2) return { ok: true, rows: [], now: Date.now(), max: MISSION_MAX };
+  var vals = sh.getRange(2, 1, last - 1, HEAD.length).getValues();
+  var rows = vals.filter(function (v) { return v[0] !== ''; }).map(function (v) {
+    var o = {};
+    HEAD.forEach(function (h, i) { o[h] = v[i]; });
+    return o;
+  });
+  return { ok: true, rows: rows, now: Date.now(), max: MISSION_MAX };
+}
+
+function reset_(d) {
+  var key = String(d.key || '');
+  return withLock_(function () {
+    var sh = sheet_();
+    var last = sh.getLastRow(), n = 0;
+    if (last < 2) return { ok: true, deleted: 0 };
+    var keys = sh.getRange(2, 1, last - 1, 1).getValues();
+    for (var i = keys.length - 1; i >= 0; i--) {
+      if (String(keys[i][0]) === key) { sh.deleteRow(i + 2); n++; }
+    }
+    return { ok: true, deleted: n };
+  });
+}
+
+function resetAll_() {
+  return withLock_(function () {
+    var sh = sheet_();
+    var last = sh.getLastRow();
+    if (last >= 2) sh.deleteRows(2, last - 1);
+    return { ok: true };
+  });
+}
+
+function setPin_(d) {
+  var p = String(d.newPin || '');
+  if (!/^\d{4,8}$/.test(p)) return { ok: false, error: 'PIN ต้องเป็นตัวเลข 4–8 หลัก' };
+  PropertiesService.getScriptProperties().setProperty('PIN', p);
+  return { ok: true };
+}
